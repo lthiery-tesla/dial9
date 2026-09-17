@@ -471,18 +471,32 @@ where
 fn build_local_runtime(
     mut builder: tokio::runtime::Builder,
 ) -> io::Result<tokio::runtime::LocalRuntime> {
-    // `Builder::build_local` panics on a multi-thread builder. Convert that
-    // into an error so attach stays non-panicking for a misconfigured builder.
+    // Tokio panics on `Kind::MultiThread` (`Builder::kind` is private). Convert
+    // that panic to an error; any other panic still unwinds.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         builder.build_local(tokio::runtime::LocalOptions::default())
     })) {
         Ok(result) => result,
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "attach_tokio_local_runtime requires a current_thread builder; \
-             multi_thread is not supported for LocalRuntime",
-        )),
+        Err(payload) => {
+            let message = panic_payload_str(&payload);
+            if message.is_some_and(|m| m.contains("multi_thread is not supported for LocalRuntime"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "attach_tokio_local_runtime requires a current_thread builder; \
+                     multi_thread is not supported for LocalRuntime",
+                ));
+            }
+            std::panic::resume_unwind(payload);
+        }
     }
+}
+
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> Option<&str> {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
 }
 
 /// Handle shared by [`tokio::runtime::Runtime`] and
