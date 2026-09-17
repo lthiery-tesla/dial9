@@ -478,7 +478,9 @@ fn build_local_runtime(
     })) {
         Ok(result) => result,
         Err(payload) => {
-            let message = panic_payload_str(&payload);
+            // Deref the box: `&payload` would coerce the `Box` itself into the
+            // trait object and downcast to the payload type would never match.
+            let message = panic_payload_str(&*payload);
             if message.is_some_and(|m| m.contains("multi_thread is not supported for LocalRuntime"))
             {
                 return Err(io::Error::new(
