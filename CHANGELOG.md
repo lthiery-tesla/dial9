@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Dial9HandleTokioExt::attach_tokio_local_runtime` builds and instruments a
+  `tokio::runtime::LocalRuntime`, so executors that run `!Send` futures (for
+  example an io_uring reactor) can attach dial9 telemetry. A multi-thread
+  builder returns an `io::Error` instead of panicking inside Tokio's
+  `build_local`. `attach_tokio_runtime` is unchanged.
+
 ### Fixed
 
 - The viewer attaches each captured task stack to the idle gap it describes.

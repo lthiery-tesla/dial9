@@ -1754,6 +1754,162 @@ mod tests {
         );
     }
 
+    /// An attached `LocalRuntime` records poll events and can `spawn_local` a
+    /// `!Send` future. Without `--cfg tokio_unstable`, polls come from
+    /// `TracedFuture`, which finds this runtime by the id bound at attach.
+    #[test]
+    fn attach_local_runtime_records_polls_and_spawn_local() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let (capture, data) = CapturingProcessor::new();
+        let rec = recorder(MemoryBuffer::new(CAPTURE_SIZE).unwrap())
+            .pipe(capture)
+            .build();
+
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        builder.enable_all();
+        let runtime = rec
+            .handle()
+            .attach_tokio_local_runtime(
+                builder,
+                TokioAttachOptions::builder().runtime_name("local").build(),
+            )
+            .unwrap();
+
+        let cell = Rc::new(Cell::new(0u32));
+        let cell_task = cell.clone();
+        let handle = rec.handle().clone();
+        let out = runtime.block_on(async move {
+            tokio::task::spawn_local(crate::TracedFuture::new(
+                async move {
+                    cell_task.set(1);
+                    tokio::task::yield_now().await;
+                    cell_task.set(2);
+                    cell_task.get()
+                },
+                Some(handle),
+            ))
+            .await
+            .unwrap()
+        });
+        assert_eq!(out, 2);
+        assert_eq!(cell.get(), 2);
+
+        drop(runtime);
+        rec.graceful_shutdown(Duration::from_secs(1));
+
+        let raw = data.lock().unwrap();
+        let events = decode_captured(&raw);
+        let count = |want: fn(&crate::telemetry::analysis_events::Dial9Event) -> bool| {
+            events.iter().filter(|e| want(e)).count()
+        };
+        let starts = count(|e| {
+            matches!(
+                e,
+                crate::telemetry::analysis_events::Dial9Event::PollStartEvent(..)
+            )
+        });
+        let ends = count(|e| {
+            matches!(
+                e,
+                crate::telemetry::analysis_events::Dial9Event::PollEndEvent(..)
+            )
+        });
+        assert!(starts > 0, "expected poll events from the local runtime");
+        assert_eq!(
+            starts, ends,
+            "every PollStart needs a PollEnd, got {starts} starts and {ends} ends"
+        );
+    }
+
+    /// A disabled recorder still yields a working untraced `LocalRuntime`.
+    #[test]
+    fn disabled_recorder_attach_local_produces_working_runtime() {
+        use std::rc::Rc;
+
+        let rec = dial9_core::recorder::recorder_disabled();
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        builder.enable_all();
+        let rt = rec
+            .handle()
+            .attach_tokio_local_runtime(builder, TokioAttachOptions::default())
+            .unwrap();
+
+        let cell = Rc::new(7u32);
+        let out = rt.block_on(async move {
+            tokio::task::spawn_local(async move { *cell })
+                .await
+                .unwrap()
+        });
+        assert_eq!(out, 7);
+        assert!(!rec.handle().is_enabled());
+    }
+
+    /// Instrumentation-disabled attach still returns a working `LocalRuntime`
+    /// and records no Tokio poll events.
+    #[test]
+    fn local_runtime_instrumentation_can_be_disabled() {
+        use std::rc::Rc;
+
+        let (capture, data) = CapturingProcessor::new();
+        let rec = recorder(MemoryBuffer::new(CAPTURE_SIZE).unwrap())
+            .pipe(capture)
+            .build();
+
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        builder.enable_all();
+        let rt = rec
+            .handle()
+            .attach_tokio_local_runtime(
+                builder,
+                TokioAttachOptions::builder()
+                    .tokio_instrumentation_enabled(false)
+                    .build(),
+            )
+            .unwrap();
+
+        let cell = Rc::new(3u32);
+        let out = rt.block_on(async move {
+            tokio::task::spawn_local(async move { *cell })
+                .await
+                .unwrap()
+        });
+        assert_eq!(out, 3);
+
+        drop(rt);
+        rec.graceful_shutdown(Duration::from_secs(1));
+
+        let raw = data.lock().unwrap();
+        let events = if raw.is_empty() {
+            Vec::new()
+        } else {
+            decode_captured(&raw)
+        };
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                crate::telemetry::analysis_events::Dial9Event::PollStartEvent(..)
+                    | crate::telemetry::analysis_events::Dial9Event::PollEndEvent(..)
+            )),
+            "Tokio poll events should not be recorded when instrumentation is disabled: {events:?}"
+        );
+    }
+
+    /// A multi-thread builder must not panic; Tokio's `build_local` would.
+    #[test]
+    fn attach_local_runtime_rejects_multi_thread_builder() {
+        let rec = recorder(MemoryBuffer::new(CAPTURE_SIZE).unwrap()).build();
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.enable_all().worker_threads(1);
+        let err = rec
+            .handle()
+            .attach_tokio_local_runtime(builder, TokioAttachOptions::default())
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        rec.graceful_shutdown(Duration::from_secs(1));
+    }
+
     // The public `handle.attach_tokio_runtime(..)` flow: one recorder, two runtimes
     // attached as feeds, driven and shut down by the caller. Both runtimes'
     // polls land in one trace.
